@@ -38,7 +38,19 @@ jobs:
         run: ./gradlew clean build -x test --no-daemon
 
       - name: Build instrumented Docker image
-        run: docker build -f poc-v2/Dockerfile -t java-tron-retry-poc:instrumented .
+        run: |
+          set -euo pipefail
+          JAR="$(find . -type f -name 'FullNode.jar' -print -quit)"
+          test -n "$JAR"
+          mkdir -p "$RUNNER_TEMP/java-tron-docker-context"
+          cp "$JAR" "$RUNNER_TEMP/java-tron-docker-context/FullNode.jar"
+          cat > "$RUNNER_TEMP/java-tron-docker-context/Dockerfile" <<'EOF'
+          FROM eclipse-temurin:8-jre
+          WORKDIR /java-tron
+          COPY FullNode.jar /java-tron/FullNode.jar
+          ENTRYPOINT ["java", "-jar", "/java-tron/FullNode.jar"]
+          EOF
+          docker build -t java-tron-retry-poc:instrumented "$RUNNER_TEMP/java-tron-docker-context"
 
       - name: Fetch official private-network configuration
         run: |
@@ -152,4 +164,4 @@ jobs:
           docker compose -f "$RUNNER_TEMP/private-net/docker-compose.yml" down -v --remove-orphans || true
           docker rm -f tron-witness1 tron-node1 2>/dev/null || true
           docker image rm java-tron-retry-poc:instrumented 2>/dev/null || true
-          rm -rf "$RUNNER_TEMP/private-net" "$RUNNER_TEMP/tron-docker"
+          rm -rf "$RUNNER_TEMP/private-net" "$RUNNER_TEMP/tron-docker" "$RUNNER_TEMP/java-tron-docker-context"
