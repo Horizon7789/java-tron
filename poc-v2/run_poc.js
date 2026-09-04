@@ -61,6 +61,13 @@ async function waitInfo(txid, timeoutMs = 180000) {
         }
         return info;
       }
+
+      // Some private-network full nodes execute and commit a transaction before
+      // gettransactioninfobyid exposes its receipt. Fall back to locating the
+      // transaction in recent blocks so the PoC does not time out after a
+      // successful execution.
+      const blockNumber = await getBlockNumberForTx(txid);
+      if (blockNumber != null) return { blockNumber };
     } catch (_) {}
     await new Promise(r => setTimeout(r, 1000));
   }
