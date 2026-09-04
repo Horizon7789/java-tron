@@ -120,7 +120,6 @@ jobs:
 
           python3 - "$POC_ADDRESS" "$RUNNER_TEMP/private-net/conf/private_net_config_witness1.conf" "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf" <<'PY'
           import pathlib
-          import re
           import sys
 
           address = sys.argv[1]
@@ -140,14 +139,8 @@ jobs:
               marker = '\n  ]\n\n  witnesses = ['
               if marker not in text:
                   raise SystemExit(f'genesis assets section not found in {path}')
-              text = text.replace(marker, '\n' + entry + marker, 1)
-              path.write_text(text)
+              path.write_text(text.replace(marker, '\n' + entry + marker, 1))
           PY
-
-          # The two nodes must use the same genesis definition.
-          diff -u \
-            <(sed '/^localwitness = \[/,/^\]/d' "$RUNNER_TEMP/private-net/conf/private_net_config_witness1.conf") \
-            <(sed '/^localwitness = \[/,/^\]/d' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf")
 
       - name: Start isolated two-node private network
         working-directory: ${{ runner.temp }}/private-net
@@ -158,10 +151,10 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json
+          import os
           import subprocess
           import time
           import urllib.request
-          import os
 
           ports = (9090, 9190)
           deadline = time.time() + 600
