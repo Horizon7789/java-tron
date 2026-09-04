@@ -11,7 +11,7 @@ permissions:
 jobs:
   reproduce:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 55
     env:
       JAVA_TOOL_OPTIONS: -Xmx5g
       GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2
@@ -59,6 +59,8 @@ jobs:
           cp "$RUNNER_TEMP/tron-docker/conf/private_net_config_witness1.conf" "$RUNNER_TEMP/private-net/conf/"
           cp "$RUNNER_TEMP/tron-docker/conf/private_net_config_others.conf" "$RUNNER_TEMP/private-net/conf/"
           sed -i 's/fullNodeEnable = false/fullNodeEnable = true/' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf"
+          # Diagnostic-only asymmetry: make validator VM budget shorter.
+          sed -i 's/maxTimeRatio = 5.0/maxTimeRatio = 0.5/' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf"
           cat > "$RUNNER_TEMP/private-net/docker-compose.yml" <<'EOF'
           services:
             tron-witness1:
@@ -73,11 +75,11 @@ jobs:
                 - ./conf:/java-tron/conf:ro
                 - ./logs/tron-witness1:/java-tron/logs
                 - ./data-witness1:/java-tron/data
-              command: ["-jvm", "{-Xmx3g -Xmn1g}", "-c", "/java-tron/conf/private_net_config_witness1.conf", "-d", "/java-tron/data", "-w"]
+              command: ["-c", "/java-tron/conf/private_net_config_witness1.conf", "-d", "/java-tron/data", "-w"]
             tron-node1:
               image: java-tron-retry-poc:instrumented
               container_name: tron-node1
-              cpus: 0.5
+              cpus: 1.0
               mem_limit: 3g
               ports:
                 - "9190:8090"
@@ -85,7 +87,7 @@ jobs:
                 - ./conf:/java-tron/conf:ro
                 - ./logs/tron-node1:/java-tron/logs
                 - ./data-node1:/java-tron/data
-              command: ["-jvm", "{-Xmx2g -Xmn768m}", "-c", "/java-tron/conf/private_net_config_others.conf", "-d", "/java-tron/data"]
+              command: ["-c", "/java-tron/conf/private_net_config_others.conf", "-d", "/java-tron/data"]
           EOF
 
       - name: Start isolated two-node private network
@@ -94,21 +96,70 @@ jobs:
 
       - name: Wait for witness and validator APIs
         run: |
+          set -euo pipefail
+          COMPOSE="$RUNNER_TEMP/private-net/docker-compose.yml"
           python3 - <<'PY'
-          import json, time, urllib.request
-          for port in (9090, 9190):
-              deadline = time.time() + 180
-              while time.time() < deadline:
+          import json
+          import subprocess
+          import time
+          import urllib.request
+          compose = "['docker', 'compose', '-f', '" + \
+                    __import__('os').environ['RUNNER_TEMP'] + \
+                    "/private-net/docker-compose.yml']"
+          ports = (9090, 9190)
+          deadline = time.time() + 600
+          def dump_state():
+              subprocess.run(
+                  ["docker", "compose", "-f",
+                   __import__("os").environ["RUNNER_TEMP"] +
+                   "/private-net/docker-compose.yml", "ps"],
+                  check=False,
+              )
+              subprocess.run(
+                  ["docker", "compose", "-f",
+                   __import__("os").environ["RUNNER_TEMP"] +
+                   "/private-net/docker-compose.yml",
+                   "logs", "--no-color", "--tail=300"],
+                  check=False,
+              )
+          while time.time() < deadline:
+              all_ready = True
+              for port in ports:
                   try:
-                      req = urllib.request.Request(f'http://127.0.0.1:{port}/wallet/getnowblock', data=b'{}', headers={'Content-Type':'application/json'})
-                      with urllib.request.urlopen(req, timeout=3) as r:
-                          if r.status == 200 and json.load(r).get('block_header'):
-                              break
+                      req = urllib.request.Request(
+                          f"http://127.0.0.1:{port}/wallet/getnowblock",
+                          data=b"{}",
+                          headers={"Content-Type": "application/json"},
+                      )
+                      with urllib.request.urlopen(req, timeout=3) as response:
+                          payload = json.load(response)
+                      if not payload.get("block_header"):
+                          all_ready = False
                   except Exception:
-                      pass
-                  time.sleep(2)
-              else:
-                  raise SystemExit(f'node API did not become ready: {port}')
+                      all_ready = False
+              if all_ready:
+                  print("Both node APIs are ready.")
+                  raise SystemExit(0)
+              states = subprocess.check_output(
+                  ["docker", "compose", "-f",
+                   __import__("os").environ["RUNNER_TEMP"] +
+                   "/private-net/docker-compose.yml",
+                   "ps", "-q"],
+                  text=True,
+              ).splitlines()
+              for cid in states:
+                  state = subprocess.check_output(
+                      ["docker", "inspect", "-f", "{{.State.Status}}", cid],
+                      text=True,
+                  ).strip()
+                  if state in ("exited", "dead"):
+                      print(f"Container {cid} stopped during startup: {state}")
+                      dump_state()
+                      raise SystemExit(1)
+              time.sleep(2)
+          print("Node APIs did not become ready within 10 minutes.")
+          dump_state()
+          raise SystemExit(1)
           PY
 
       - name: Install PoC transaction dependencies
