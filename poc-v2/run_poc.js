@@ -49,7 +49,7 @@ async function main() {
   const { abi, bytecode } = compile();
 
   const deployTx = await tronWeb.transactionBuilder.createSmartContract({
-    abi: JSON.stringify(abi), bytecode, name: 'RetryCalibrator', feeLimit: 10_000_000_000,
+    abi: JSON.stringify(abi), bytecode, name: 'RetryCalibrator', feeLimit: 100_000_000,
     callValue: 0, userFeePercentage: 100, originEnergyLimit: 10_000_000
   }, owner);
   const signedDeploy = await tronWeb.trx.sign(deployTx, PRIVATE_KEY);
@@ -65,7 +65,7 @@ async function main() {
     console.log(`candidate=${n}`);
     try {
       const built = await tronWeb.transactionBuilder.triggerSmartContract(
-        contractAddress, 'burn(uint256)', { feeLimit: 10_000_000_000, callValue: 0 },
+        contractAddress, 'burn(uint256)', { feeLimit: 100_000_000, callValue: 0 },
         [{ type: 'uint256', value: n }], owner);
       const signed = await tronWeb.trx.sign(built.transaction, PRIVATE_KEY);
       const sent = await tronWeb.trx.sendRawTransaction(signed);
