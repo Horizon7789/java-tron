@@ -52,6 +52,10 @@ jobs:
           EOF
           docker build -t java-tron-retry-poc:instrumented "$RUNNER_TEMP/java-tron-docker-context"
 
+      - name: Install PoC transaction dependencies
+        working-directory: poc-v2
+        run: npm install --no-audit --no-fund
+
       - name: Fetch official private-network configuration
         run: |
           git clone --depth 1 https://github.com/tronprotocol/tron-docker.git "$RUNNER_TEMP/tron-docker"
@@ -90,6 +94,61 @@ jobs:
               command: ["-c", "/java-tron/conf/private_net_config_others.conf", "-d", "/java-tron/data"]
           EOF
 
+      - name: Seed funded PoC account into genesis state
+        env:
+          POC_PRIVATE_KEY: ${{ secrets.POC_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          CONFIG="$RUNNER_TEMP/private-net/conf/private_net_config_witness1.conf"
+          if [ -z "$POC_PRIVATE_KEY" ]; then
+            POC_PRIVATE_KEY="$(grep -oE '[0-9a-fA-F]{64}' "$CONFIG" | head -1)"
+          fi
+          if ! printf '%s' "$POC_PRIVATE_KEY" | grep -qE '^[0-9a-fA-F]{64}$'; then
+            echo "POC_PRIVATE_KEY must be a 64-character hex private key" >&2
+            exit 1
+          fi
+          echo "::add-mask::$POC_PRIVATE_KEY"
+          printf 'POC_PRIVATE_KEY=%s\n' "$POC_PRIVATE_KEY" >> "$GITHUB_ENV"
+
+          POC_ADDRESS="$(node -e 'const TronWeb = require("tronweb"); const key = process.env.POC_PRIVATE_KEY; const address = TronWeb.address.fromPrivateKey(key); if (!address) process.exit(1); process.stdout.write(address);')"
+          if ! printf '%s' "$POC_ADDRESS" | grep -qE '^T[1-9A-HJ-NP-Za-km-z]{33}$'; then
+            echo "Derived PoC address is invalid" >&2
+            exit 1
+          fi
+          printf 'POC_ADDRESS=%s\n' "$POC_ADDRESS" >> "$GITHUB_ENV"
+          echo "PoC account prepared: $POC_ADDRESS"
+
+          python3 - "$POC_ADDRESS" "$RUNNER_TEMP/private-net/conf/private_net_config_witness1.conf" "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          address = sys.argv[1]
+          entry = f'''    {{
+              accountName = "RetryPoC"
+              accountType = "Normal"
+              address = "{address}"
+              balance = "1000000000000000"
+            }}
+          '''
+
+          for filename in sys.argv[2:]:
+              path = pathlib.Path(filename)
+              text = path.read_text()
+              if address in text:
+                  continue
+              marker = '\n  ]\n\n  witnesses = ['
+              if marker not in text:
+                  raise SystemExit(f'genesis assets section not found in {path}')
+              text = text.replace(marker, '\n' + entry + marker, 1)
+              path.write_text(text)
+          PY
+
+          # The two nodes must use the same genesis definition.
+          diff -u \
+            <(sed '/^localwitness = \[/,/^\]/d' "$RUNNER_TEMP/private-net/conf/private_net_config_witness1.conf") \
+            <(sed '/^localwitness = \[/,/^\]/d' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf")
+
       - name: Start isolated two-node private network
         working-directory: ${{ runner.temp }}/private-net
         run: docker compose up -d
@@ -97,31 +156,21 @@ jobs:
       - name: Wait for witness and validator APIs
         run: |
           set -euo pipefail
-          COMPOSE="$RUNNER_TEMP/private-net/docker-compose.yml"
           python3 - <<'PY'
           import json
           import subprocess
           import time
           import urllib.request
-          compose = "['docker', 'compose', '-f', '" + \
-                    __import__('os').environ['RUNNER_TEMP'] + \
-                    "/private-net/docker-compose.yml']"
+          import os
+
           ports = (9090, 9190)
           deadline = time.time() + 600
+
           def dump_state():
-              subprocess.run(
-                  ["docker", "compose", "-f",
-                   __import__("os").environ["RUNNER_TEMP"] +
-                   "/private-net/docker-compose.yml", "ps"],
-                  check=False,
-              )
-              subprocess.run(
-                  ["docker", "compose", "-f",
-                   __import__("os").environ["RUNNER_TEMP"] +
-                   "/private-net/docker-compose.yml",
-                   "logs", "--no-color", "--tail=300"],
-                  check=False,
-              )
+              compose = os.environ['RUNNER_TEMP'] + '/private-net/docker-compose.yml'
+              subprocess.run(["docker", "compose", "-f", compose, "ps"], check=False)
+              subprocess.run(["docker", "compose", "-f", compose, "logs", "--no-color", "--tail=300"], check=False)
+
           while time.time() < deadline:
               all_ready = True
               for port in ports:
@@ -140,18 +189,10 @@ jobs:
               if all_ready:
                   print("Both node APIs are ready.")
                   raise SystemExit(0)
-              states = subprocess.check_output(
-                  ["docker", "compose", "-f",
-                   __import__("os").environ["RUNNER_TEMP"] +
-                   "/private-net/docker-compose.yml",
-                   "ps", "-q"],
-                  text=True,
-              ).splitlines()
+              compose = os.environ['RUNNER_TEMP'] + '/private-net/docker-compose.yml'
+              states = subprocess.check_output(["docker", "compose", "-f", compose, "ps", "-q"], text=True).splitlines()
               for cid in states:
-                  state = subprocess.check_output(
-                      ["docker", "inspect", "-f", "{{.State.Status}}", cid],
-                      text=True,
-                  ).strip()
+                  state = subprocess.check_output(["docker", "inspect", "-f", "{{.State.Status}}", cid], text=True).strip()
                   if state in ("exited", "dead"):
                       print(f"Container {cid} stopped during startup: {state}")
                       dump_state()
@@ -162,21 +203,33 @@ jobs:
           raise SystemExit(1)
           PY
 
-      - name: Install PoC transaction dependencies
-        working-directory: poc-v2
-        run: npm install --no-audit --no-fund
+      - name: Verify funded PoC account
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          address = os.environ['POC_ADDRESS']
+          req = urllib.request.Request(
+              'http://127.0.0.1:9090/wallet/getaccount',
+              data=json.dumps({'address': address, 'visible': True}).encode(),
+              headers={'Content-Type': 'application/json'},
+          )
+          with urllib.request.urlopen(req, timeout=20) as response:
+              account = json.load(response)
+          balance = int(account.get('balance', 0))
+          if not account.get('address') or balance < 1_000_000_000_000:
+              raise SystemExit(f'PoC account was not seeded with sufficient TRX: {account}')
+          print(f"PoC account exists with {balance} SUN")
+          PY
 
       - name: Submit calibrated transaction sweep
         working-directory: poc-v2
         env:
           PRODUCER_RPC: http://127.0.0.1:9090
-          POC_PRIVATE_KEY: ${{ secrets.POC_PRIVATE_KEY }}
-        run: |
-          if [ -z "$POC_PRIVATE_KEY" ]; then
-            POC_PRIVATE_KEY="$(grep -oE '[0-9a-fA-F]{64}' "$RUNNER_TEMP/tron-docker/conf/private_net_config_witness1.conf" | head -1)"
-            export POC_PRIVATE_KEY
-          fi
-          node run_poc.js | tee poc-submit.log
+        run: node run_poc.js | tee poc-submit.log
 
       - name: Run fail-closed verifier
         working-directory: poc-v2
