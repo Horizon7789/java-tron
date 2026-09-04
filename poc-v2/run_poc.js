@@ -3,9 +3,11 @@ const solc = require('solc');
 const fs = require('fs');
 
 const RPC = process.env.PRODUCER_RPC || 'http://127.0.0.1:9090';
+const VALIDATOR_RPC = process.env.VALIDATOR_RPC || 'http://127.0.0.1:9190';
 const PRIVATE_KEY = process.env.POC_PRIVATE_KEY;
 if (!PRIVATE_KEY) throw new Error('POC_PRIVATE_KEY is required; obtain it from the isolated private-net demo configuration at runtime.');
 const tronWeb = new TronWeb({ fullHost: RPC, privateKey: PRIVATE_KEY });
+const validatorWeb = new TronWeb({ fullHost: VALIDATOR_RPC, privateKey: PRIVATE_KEY });
 
 const source = `pragma solidity ^0.5.17;
 contract RetryCalibrator {
@@ -32,43 +34,16 @@ function compile() {
   return { abi: c.abi, bytecode: c.evm.bytecode.object };
 }
 
-async function getBlockNumberForTx(txid, maxBlocks = 30) {
-  try {
-    const latest = await tronWeb.trx.getCurrentBlock();
-    const latestNumber = latest && latest.block_header && latest.block_header.raw_data
-      ? latest.block_header.raw_data.number : null;
-    if (latestNumber == null) return null;
-    for (let number = latestNumber; number >= Math.max(0, latestNumber - maxBlocks); number--) {
-      try {
-        const block = await tronWeb.trx.getBlockByNumber(number);
-        const transactions = (block && block.transactions) || [];
-        if (transactions.some(tx => (tx.txID || tx.txid || tx.id) === txid)) return number;
-      } catch (_) {}
-    }
-  } catch (_) {}
-  return null;
-}
-
 async function waitInfo(txid, timeoutMs = 180000) {
+  const clients = [tronWeb, validatorWeb];
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    try {
-      const info = await tronWeb.trx.getTransactionInfo(txid);
-      if (info && (info.blockNumber || info.contract_address || info.receipt)) {
-        if (!info.blockNumber) {
-          const blockNumber = await getBlockNumberForTx(txid);
-          if (blockNumber != null) info.blockNumber = blockNumber;
-        }
-        return info;
-      }
-
-      // Some private-network full nodes execute and commit a transaction before
-      // gettransactioninfobyid exposes its receipt. Fall back to locating the
-      // transaction in recent blocks so the PoC does not time out after a
-      // successful execution.
-      const blockNumber = await getBlockNumberForTx(txid);
-      if (blockNumber != null) return { blockNumber };
-    } catch (_) {}
+    for (const client of clients) {
+      try {
+        const info = await client.trx.getTransactionInfo(txid);
+        if (info && (info.blockNumber || info.contract_address || info.receipt)) return info;
+      } catch (_) {}
+    }
     await new Promise(r => setTimeout(r, 1000));
   }
   throw new Error(`timeout waiting for ${txid}`);
@@ -85,9 +60,10 @@ async function main() {
   const signedDeploy = await tronWeb.trx.sign(deployTx, PRIVATE_KEY);
   const deployBroadcast = await tronWeb.trx.sendRawTransaction(signedDeploy);
   if (!deployBroadcast.result) throw new Error(`deployment broadcast failed: ${JSON.stringify(deployBroadcast)}`);
-  const deployInfo = await waitInfo(deployBroadcast.txid || deployTx.txID);
-  const contractAddress = deployInfo.contract_address || deployTx.contract_address;
-  if (!contractAddress) throw new Error(`no contract address: ${JSON.stringify(deployInfo)}`);
+  const deployTxid = deployBroadcast.txid || deployTx.txID;
+  const deployInfo = await waitInfo(deployTxid);
+  const contractAddress = deployInfo.contract_address || deployInfo.contractAddress || deployTx.contract_address;
+  if (!contractAddress) throw new Error(`no contract address for ${deployTxid}: ${JSON.stringify(deployInfo)}`);
   console.log(`contract=${contractAddress}`);
 
   const candidates = [10000, 20000, 40000, 80000, 120000, 160000, 220000, 300000, 400000];
