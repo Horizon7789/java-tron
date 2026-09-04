@@ -46,8 +46,6 @@ async function waitInfo(txid, timeoutMs = 180000) {
 
 async function main() {
   const owner = tronWeb.address.fromPrivateKey(PRIVATE_KEY);
-  console.log(`owner=${owner}`);
-  console.log(`balance=${await tronWeb.trx.getBalance(owner)}`);
   const { abi, bytecode } = compile();
 
   const deployTx = await tronWeb.transactionBuilder.createSmartContract({
