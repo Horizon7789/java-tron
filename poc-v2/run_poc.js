@@ -32,12 +32,35 @@ function compile() {
   return { abi: c.abi, bytecode: c.evm.bytecode.object };
 }
 
+async function getBlockNumberForTx(txid, maxBlocks = 30) {
+  try {
+    const latest = await tronWeb.trx.getCurrentBlock();
+    const latestNumber = latest && latest.block_header && latest.block_header.raw_data
+      ? latest.block_header.raw_data.number : null;
+    if (latestNumber == null) return null;
+    for (let number = latestNumber; number >= Math.max(0, latestNumber - maxBlocks); number--) {
+      try {
+        const block = await tronWeb.trx.getBlockByNumber(number);
+        const transactions = (block && block.transactions) || [];
+        if (transactions.some(tx => (tx.txID || tx.txid || tx.id) === txid)) return number;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return null;
+}
+
 async function waitInfo(txid, timeoutMs = 180000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
       const info = await tronWeb.trx.getTransactionInfo(txid);
-      if (info && info.blockNumber) return info;
+      if (info && (info.blockNumber || info.contract_address || info.receipt)) {
+        if (!info.blockNumber) {
+          const blockNumber = await getBlockNumberForTx(txid);
+          if (blockNumber != null) info.blockNumber = blockNumber;
+        }
+        return info;
+      }
     } catch (_) {}
     await new Promise(r => setTimeout(r, 1000));
   }
