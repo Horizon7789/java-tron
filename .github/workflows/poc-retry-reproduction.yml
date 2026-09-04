@@ -63,7 +63,6 @@ jobs:
           cp "$RUNNER_TEMP/tron-docker/conf/private_net_config_witness1.conf" "$RUNNER_TEMP/private-net/conf/"
           cp "$RUNNER_TEMP/tron-docker/conf/private_net_config_others.conf" "$RUNNER_TEMP/private-net/conf/"
           sed -i 's/fullNodeEnable = false/fullNodeEnable = true/' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf"
-          # Diagnostic-only asymmetry: make validator VM budget shorter.
           sed -i 's/maxTimeRatio = 5.0/maxTimeRatio = 0.5/' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf"
           cat > "$RUNNER_TEMP/private-net/docker-compose.yml" <<'EOF'
           services:
@@ -95,6 +94,7 @@ jobs:
           EOF
 
       - name: Seed funded PoC account into genesis state
+        working-directory: poc-v2
         env:
           POC_PRIVATE_KEY: ${{ secrets.POC_PRIVATE_KEY }}
         run: |
