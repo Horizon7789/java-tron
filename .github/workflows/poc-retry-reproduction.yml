@@ -261,4 +261,4 @@ jobs:
           docker compose -f "$RUNNER_TEMP/private-net/docker-compose.yml" down -v --remove-orphans || true
           docker rm -f tron-witness1 tron-node1 2>/dev/null || true
           docker image rm java-tron-retry-poc:instrumented 2>/dev/null || true
-          rm -rf "$RUNNER_TEMP/private-net" "$RUNNER_TEMP/tron-docker" "$RUNNER_TEMP/java-tron-docker-context"
+          sudo rm -rf "$RUNNER_TEMP/private-net" "$RUNNER_TEMP/tron-docker" "$RUNNER_TEMP/java-tron-docker-context"
