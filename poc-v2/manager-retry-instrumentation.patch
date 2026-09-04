@@ -1,15 +1,14 @@
+diff --git a/chainbase/src/main/java/org/tron/core/db/TransactionTrace.java b/chainbase/src/main/java/org/tron/core/db/TransactionTrace.java
 --- a/chainbase/src/main/java/org/tron/core/db/TransactionTrace.java
 +++ b/chainbase/src/main/java/org/tron/core/db/TransactionTrace.java
-@@ -6,6 +6,8 @@
- import static org.tron.common.runtime.InternalTransaction.TrxType.TRX_CONTRACT_CREATION_TYPE;
- import static org.tron.protos.contract.Common.ResourceCode.ENERGY;
+@@ -8,6 +8,8 @@ import static org.tron.protos.contract.Common.ResourceCode.ENERGY;
  
 +import java.lang.management.ManagementFactory;
 +import java.lang.management.ThreadMXBean;
  import java.util.Objects;
  import lombok.Getter;
  import lombok.Setter;
-@@ -70,9 +72,15 @@
+@@ -68,6 +70,12 @@ public class TransactionTrace {
  
    private Runtime runtime;
  
@@ -20,7 +19,8 @@
 +  private long retryPocWallNanos;
 +
    private ForkController forkController;
-@@ -186,9 +194,31 @@
+ 
+@@ -186,9 +194,31 @@ public class TransactionTrace {
    public void exec()
        throws ContractExeException, ContractValidateException, VMIllegalException {
      /*  VM execute  */
@@ -50,23 +50,14 @@
 +        transactionContext.getProgramResult().getEnergyUsed(),
 +        retryPocCpuNanos,
 +        retryPocWallNanos);
-@@ -202,6 +232,14 @@
- //    }
-   }
-+
-+  public int getRetryPocExecCount() {
-+    return retryPocExecCount;
-+  }
-+
-+  public long getRetryPocCpuNanos() {
-+    return retryPocCpuNanos;
-+  }
  
-   public void saveEnergyLeftOfOrigin(long energyLeft) {
-     receipt.setOriginEnergyLeft(energyLeft);
+ //    if (TrxType.TRX_PRECOMPILED_TYPE != trxType) {
+ //      if (contractResult.OUT_OF_TIME
+ //          .equals(receipt.getResult())) {
+*** Update File: framework/src/main/java/org/tron/core/db/Manager.java
 --- a/framework/src/main/java/org/tron/core/db/Manager.java
 +++ b/framework/src/main/java/org/tron/core/db/Manager.java
-@@ -1562,11 +1562,15 @@
+@@ -1562,7 +1562,11 @@ public class Manager {
  
      if (Objects.nonNull(blockCap)) {
        trace.setResult();
@@ -79,8 +70,3 @@
          trace.init(blockCap, eventPluginLoaded);
          trace.checkIsConstant();
          trace.exec();
-         trace.setResult();
-         logger.info("Retry result when push: {}, for tx id: {}, tx resultCode in receipt: {}.",
-             blockCap.hasWitnessSignature(), txId, trace.getReceipt().getResult());
-       }
-*** End Patch
