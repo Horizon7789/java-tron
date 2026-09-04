@@ -2,6 +2,7 @@
   "private": true,
   "dependencies": {
     "tronweb": "5.3.2",
+    "@noble/secp256k1": "1.7.1",
     "solc": "0.5.17"
   }
 }
