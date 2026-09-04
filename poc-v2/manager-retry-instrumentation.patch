@@ -1,0 +1,86 @@
+--- a/chainbase/src/main/java/org/tron/core/db/TransactionTrace.java
++++ b/chainbase/src/main/java/org/tron/core/db/TransactionTrace.java
+@@ -6,6 +6,8 @@
+ import static org.tron.common.runtime.InternalTransaction.TrxType.TRX_CONTRACT_CREATION_TYPE;
+ import static org.tron.protos.contract.Common.ResourceCode.ENERGY;
+ 
++import java.lang.management.ManagementFactory;
++import java.lang.management.ThreadMXBean;
+ import java.util.Objects;
+ import lombok.Getter;
+ import lombok.Setter;
+@@ -70,9 +72,15 @@
+ 
+   private Runtime runtime;
+ 
++  private static final ThreadMXBean RETRY_POC_CPU_TIMER =
++      ManagementFactory.getThreadMXBean();
++  private int retryPocExecCount;
++  private long retryPocCpuNanos;
++  private long retryPocWallNanos;
++
+   private ForkController forkController;
+@@ -186,9 +194,31 @@
+   public void exec()
+       throws ContractExeException, ContractValidateException, VMIllegalException {
+     /*  VM execute  */
+-    runtime.execute(transactionContext);
++    retryPocExecCount++;
++    long wallStart = System.nanoTime();
++    long cpuStart = RETRY_POC_CPU_TIMER.isCurrentThreadCpuTimeSupported()
++        ? RETRY_POC_CPU_TIMER.getCurrentThreadCpuTime() : -1L;
++    try {
++      runtime.execute(transactionContext);
++    } finally {
++      long wallEnd = System.nanoTime();
++      retryPocWallNanos += wallEnd - wallStart;
++      if (cpuStart >= 0 && RETRY_POC_CPU_TIMER.isCurrentThreadCpuTimeSupported()) {
++        long cpuEnd = RETRY_POC_CPU_TIMER.getCurrentThreadCpuTime();
++        if (cpuEnd >= cpuStart) {
++          retryPocCpuNanos += cpuEnd - cpuStart;
++        }
++      }
++    }
+     setBill(transactionContext.getProgramResult().getEnergyUsed());
+     setPenalty(transactionContext.getProgramResult().getEnergyPenaltyTotal());
++    logger.info("RETRY_POC txId={} execution={} result={} energy={} cpuNanos={} wallNanos={}",
++        trx.getTransactionId(),
++        retryPocExecCount,
++        transactionContext.getProgramResult().getResultCode(),
++        transactionContext.getProgramResult().getEnergyUsed(),
++        retryPocCpuNanos,
++        retryPocWallNanos);
+@@ -202,6 +232,14 @@
+ //    }
+   }
++
++  public int getRetryPocExecCount() {
++    return retryPocExecCount;
++  }
++
++  public long getRetryPocCpuNanos() {
++    return retryPocCpuNanos;
++  }
+ 
+   public void saveEnergyLeftOfOrigin(long energyLeft) {
+     receipt.setOriginEnergyLeft(energyLeft);
+--- a/framework/src/main/java/org/tron/core/db/Manager.java
++++ b/framework/src/main/java/org/tron/core/db/Manager.java
+@@ -1562,11 +1562,15 @@
+ 
+     if (Objects.nonNull(blockCap)) {
+       trace.setResult();
+-      if (trace.checkNeedRetry()) {
++      boolean retryPocNeedRetry = trace.checkNeedRetry();
++      logger.info("RETRY_POC decision txId={} storedResult={} firstResult={} needRetry={}",
++          txId, trxCap.getContractRet(), trace.getReceipt().getResult(),
++          retryPocNeedRetry);
++      if (retryPocNeedRetry) {
+         trace.init(blockCap, eventPluginLoaded);
+         trace.checkIsConstant();
+         trace.exec();
+         trace.setResult();
+         logger.info("Retry result when push: {}, for tx id: {}, tx resultCode in receipt: {}.",
+             blockCap.hasWitnessSignature(), txId, trace.getReceipt().getResult());
+       }
+*** End Patch
