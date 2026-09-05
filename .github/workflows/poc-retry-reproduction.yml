@@ -158,9 +158,9 @@ jobs:
 
           ports = (9090, 9190)
           deadline = time.time() + 600
+          compose = os.environ['RUNNER_TEMP'] + '/private-net/docker-compose.yml'
 
           def dump_state():
-              compose = os.environ['RUNNER_TEMP'] + '/private-net/docker-compose.yml'
               subprocess.run(["docker", "compose", "-f", compose, "ps"], check=False)
               subprocess.run(["docker", "compose", "-f", compose, "logs", "--no-color", "--tail=300"], check=False)
 
@@ -179,18 +179,31 @@ jobs:
                           all_ready = False
                   except Exception:
                       all_ready = False
+
               if all_ready:
                   print("Both node APIs are ready.")
                   raise SystemExit(0)
-              compose = os.environ['RUNNER_TEMP'] + '/private-net/docker-compose.yml'
-              states = subprocess.check_output(["docker", "compose", "-f", compose, "ps", "-q"], text=True).splitlines()
+
+              try:
+                  states = subprocess.check_output(
+                      ["docker", "compose", "-f", compose, "ps", "-q"],
+                      text=True,
+                  ).splitlines()
+              except subprocess.CalledProcessError:
+                  states = []
+
               for cid in states:
-                  state = subprocess.check_output(["docker", "inspect", "-f", "{{.State.Status}}", cid], text=True).strip()
+                  state = subprocess.check_output(
+                      ["docker", "inspect", "-f", "{{.State.Status}}", cid],
+                      text=True,
+                  ).strip()
                   if state in ("exited", "dead"):
                       print(f"Container {cid} stopped during startup: {state}")
                       dump_state()
                       raise SystemExit(1)
+
               time.sleep(2)
+
           print("Node APIs did not become ready within 10 minutes.")
           dump_state()
           raise SystemExit(1)
@@ -222,6 +235,7 @@ jobs:
         working-directory: poc-v2
         env:
           PRODUCER_RPC: http://127.0.0.1:9090
+          VALIDATOR_RPC: http://127.0.0.1:9190
         run: node run_poc.js | tee poc-submit.log
 
       - name: Run fail-closed verifier
