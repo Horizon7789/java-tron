@@ -7,7 +7,6 @@ const VALIDATOR_RPC = process.env.VALIDATOR_RPC || 'http://127.0.0.1:9190';
 const PRIVATE_KEY = process.env.POC_PRIVATE_KEY;
 if (!PRIVATE_KEY) throw new Error('POC_PRIVATE_KEY is required; obtain it from the isolated private-net demo configuration at runtime.');
 const tronWeb = new TronWeb({ fullHost: RPC, privateKey: PRIVATE_KEY });
-const validatorWeb = new TronWeb({ fullHost: VALIDATOR_RPC, privateKey: PRIVATE_KEY });
 
 const source = `pragma solidity ^0.5.17;
 contract RetryCalibrator {
@@ -53,24 +52,17 @@ async function findCommittedTransaction(txid, timeoutMs = 180000) {
       if (typeof number !== 'number') throw new Error('producer getnowblock returned no block number');
       if (number !== lastBlock) {
         lastBlock = number;
-        // Only a small recent window is needed because this function is called
-        // immediately after broadcast. Scanning newest-to-oldest also avoids
-        // depending on gettransactioninfobyid indexing on a private network.
         for (let n = number; n >= Math.max(0, number - 12); n--) {
           const block = await tronWeb.trx.getBlockByNum(n);
           const tx = (block && block.transactions || []).find(item => txIdOf(item) === txid);
           if (tx) {
             let info = {};
-            try {
-              info = await tronWeb.trx.getTransactionInfo(txid);
-            } catch (_) {}
+            try { info = await tronWeb.trx.getTransactionInfo(txid); } catch (_) {}
             return { blockNumber: n, block, tx, info };
           }
         }
       }
-    } catch (e) {
-      // Keep polling; node APIs can briefly disagree while the private chain advances.
-    }
+    } catch (e) {}
     await new Promise(r => setTimeout(r, 500));
   }
   throw new Error(`timeout waiting for committed transaction ${txid}`);
@@ -106,16 +98,12 @@ async function main() {
   console.log(`deployment_result=${deploy.result}`);
   console.log(`deployment_energy=${deploy.energy}`);
 
-  // The transaction-info endpoint is the authoritative source for the newly
-  // created contract address. Block scanning above supplies the commit/block
-  // detection that private-network indexing can otherwise fail to expose.
   const contractAddress = deploy.contractAddress || deployTx.contract_address;
-  if (!contractAddress) {
-    throw new Error(`deployment committed in block ${deploy.blockNumber}, but no contract address was returned by transaction-info`);
-  }
+  if (!contractAddress) throw new Error(`deployment committed in block ${deploy.blockNumber}, but no contract address was returned by transaction-info`);
   console.log(`contract=${contractAddress}`);
 
   const candidates = [10000, 20000, 40000, 80000, 120000, 160000, 220000, 300000, 400000];
+  const submitted = [];
   for (const n of candidates) {
     console.log(`candidate=${n}`);
     try {
@@ -127,24 +115,57 @@ async function main() {
       const txid = sent.txid || built.transaction.txID;
       console.log(`txid=${txid}`);
       if (!sent.result) { console.log(`broadcast_failed=${JSON.stringify(sent)}`); continue; }
-
       const committed = await waitCommitted(txid);
       console.log(`candidate_result=${committed.result}`);
       console.log(`candidate_block=${committed.blockNumber}`);
       console.log(`candidate_energy=${committed.energy}`);
-      if (committed.result === 'SUCCESS') {
-        fs.writeFileSync('poc-result.json', JSON.stringify({
-          txid,
-          blockNumber: committed.blockNumber,
-          contractAddress,
-          loop: n,
-          producerInfo: committed.info,
-          producerBlockTransaction: committed.tx
-        }, null, 2));
-        return;
-      }
-    } catch (e) { console.log(`candidate_error=${e.message || e}`); }
+      submitted.push({ txid, loop: n, committed });
+    } catch (e) {
+      console.log(`candidate_error=${e.message || e}`);
+    }
   }
-  throw new Error('No producer-side SUCCESS candidate found');
+
+  // Do not select based on producer SUCCESS. The validator log is the source
+  // of truth for whether the retry predicate was actually entered.
+  const logPath = process.env.VALIDATOR_LOG;
+  if (!logPath) throw new Error('VALIDATOR_LOG is required for retry candidate selection');
+  const logText = fs.readFileSync(logPath, 'utf8');
+  const byTx = new Map();
+  const retryRe = /RETRY_POC txId=([0-9a-fA-F]+) execution=([0-9]+) result=([A-Z_]+)/g;
+  let match;
+  while ((match = retryRe.exec(logText)) !== null) {
+    const [, txid, execution, result] = match;
+    if (!byTx.has(txid)) byTx.set(txid, []);
+    byTx.get(txid).push({ execution: Number(execution), result });
+  }
+
+  const eligible = submitted.filter(item => {
+    const records = (byTx.get(item.txid) || []).sort((a, b) => a.execution - b.execution);
+    const exactOrdinals = records.map(r => r.execution).join(',') === '1,2';
+    const firstTimedOut = records[0] && records[0].result === 'OUT_OF_TIME';
+    return item.committed.result !== 'OUT_OF_TIME' && exactOrdinals && firstTimedOut;
+  });
+
+  if (!eligible.length) {
+    console.error('RETRY NOT REPRODUCED: no candidate had validator execution [1, 2] with execution 1 OUT_OF_TIME and a non-timeout producer result.');
+    throw new Error('retry not reproduced');
+  }
+
+  const selected = eligible[0];
+  const selectedRecords = byTx.get(selected.txid).sort((a, b) => a.execution - b.execution);
+  console.log(`selected_retry_txid=${selected.txid}`);
+  console.log(`selected_retry_loop=${selected.loop}`);
+  console.log(`selected_retry_records=${JSON.stringify(selectedRecords)}`);
+
+  fs.writeFileSync('poc-result.json', JSON.stringify({
+    txid: selected.txid,
+    blockNumber: selected.committed.blockNumber,
+    contractAddress,
+    loop: selected.loop,
+    producerInfo: selected.committed.info,
+    producerBlockTransaction: selected.committed.tx,
+    validatorExecutions: selectedRecords,
+    selection: 'validator-log retry evidence'
+  }, null, 2));
 }
 main().catch(e => { console.error(e.stack || e); process.exit(1); });
