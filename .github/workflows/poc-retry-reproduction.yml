@@ -1,12 +1,7 @@
 name: Retry PoC reproduction
 
 on:
-  push:
-    branches: [poc-retry-reproduction]
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   reproduce:
@@ -16,263 +11,67 @@ jobs:
       JAVA_TOOL_OPTIONS: -Xmx5g
       GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2
     steps:
-      - name: Checkout pinned fork commit
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 8
+      - name: Set up Java 8
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '8'
-          cache: gradle
+
+      - name: Install PoC dependencies
+        working-directory: poc-v2
+        run: npm install
 
       - name: Apply retry instrumentation
-        run: python3 poc-v2/apply_instrumentation.py
-
-      - name: Verify instrumentation changes
-        run: |
-          grep -n "RETRY_POC" chainbase/src/main/java/org/tron/core/db/TransactionTrace.java
-          grep -n "RETRY_POC" framework/src/main/java/org/tron/core/db/Manager.java
+        working-directory: poc-v2
+        run: python3 apply_instrumentation.py
 
       - name: Build instrumented java-tron
-        run: ./gradlew clean build -x test --no-daemon
+        run: ./gradlew clean build -x test
 
-      - name: Build instrumented Docker image
-        run: |
-          set -euo pipefail
-          JAR="$(find . -type f -name 'FullNode.jar' -print -quit)"
-          test -n "$JAR"
-          mkdir -p "$RUNNER_TEMP/java-tron-docker-context"
-          cp "$JAR" "$RUNNER_TEMP/java-tron-docker-context/FullNode.jar"
-          cat > "$RUNNER_TEMP/java-tron-docker-context/Dockerfile" <<'EOF'
-          FROM eclipse-temurin:8-jre
-          WORKDIR /java-tron
-          COPY FullNode.jar /java-tron/FullNode.jar
-          ENTRYPOINT ["java", "-jar", "/java-tron/FullNode.jar"]
-          EOF
-          docker build -t java-tron-retry-poc:instrumented "$RUNNER_TEMP/java-tron-docker-context"
-
-      - name: Install PoC transaction dependencies
+      - name: Build PoC Docker image
         working-directory: poc-v2
-        run: npm install --no-audit --no-fund
+        run: docker build -t retry-poc .
 
-      - name: Fetch official private-network configuration
-        run: |
-          git clone --depth 1 https://github.com/tronprotocol/tron-docker.git "$RUNNER_TEMP/tron-docker"
-          mkdir -p "$RUNNER_TEMP/private-net/conf" "$RUNNER_TEMP/private-net/logs/tron-witness1" "$RUNNER_TEMP/private-net/logs/tron-node1"
-          cp "$RUNNER_TEMP/tron-docker/conf/private_net_config_witness1.conf" "$RUNNER_TEMP/private-net/conf/"
-          cp "$RUNNER_TEMP/tron-docker/conf/private_net_config_others.conf" "$RUNNER_TEMP/private-net/conf/"
-          sed -i 's/fullNodeEnable = false/fullNodeEnable = true/' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf"
-          sed -i 's/maxTimeRatio = 5.0/maxTimeRatio = 0.5/' "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf"
-          cat > "$RUNNER_TEMP/private-net/docker-compose.yml" <<'EOF'
-          services:
-            tron-witness1:
-              image: java-tron-retry-poc:instrumented
-              container_name: tron-witness1
-              cpus: 2.0
-              mem_limit: 4g
-              ports:
-                - "9090:8090"
-                - "50051:50051"
-              volumes:
-                - ./conf:/java-tron/conf:ro
-                - ./logs/tron-witness1:/java-tron/logs
-                - ./data-witness1:/java-tron/data
-              command: ["-c", "/java-tron/conf/private_net_config_witness1.conf", "-d", "/java-tron/data", "-w"]
-            tron-node1:
-              image: java-tron-retry-poc:instrumented
-              container_name: tron-node1
-              cpus: 1.0
-              mem_limit: 3g
-              ports:
-                - "9190:8090"
-              volumes:
-                - ./conf:/java-tron/conf:ro
-                - ./logs/tron-node1:/java-tron/logs
-                - ./data-node1:/java-tron/data
-              command: ["-c", "/java-tron/conf/private_net_config_others.conf", "-d", "/java-tron/data"]
-          EOF
-
-      - name: Seed funded PoC account into genesis state
+      - name: Start private network
         working-directory: poc-v2
-        env:
-          POC_PRIVATE_KEY: ${{ secrets.POC_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          CONFIG="$RUNNER_TEMP/private-net/conf/private_net_config_witness1.conf"
-          if [ -z "$POC_PRIVATE_KEY" ]; then
-            POC_PRIVATE_KEY="$(grep -oE '[0-9a-fA-F]{64}' "$CONFIG" | head -1)"
-          fi
-          if ! printf '%s' "$POC_PRIVATE_KEY" | grep -qE '^[0-9a-fA-F]{64}$'; then
-            echo "POC_PRIVATE_KEY must be a 64-character hex private key" >&2
-            exit 1
-          fi
-          echo "::add-mask::$POC_PRIVATE_KEY"
-          printf 'POC_PRIVATE_KEY=%s\n' "$POC_PRIVATE_KEY" >> "$GITHUB_ENV"
+        run: ./start_private_net.sh
 
-          POC_ADDRESS="$(node -e 'const TronWeb = require("tronweb"); const key = process.env.POC_PRIVATE_KEY; const address = TronWeb.address.fromPrivateKey(key); if (!address) process.exit(1); process.stdout.write(address);')"
-          if ! printf '%s' "$POC_ADDRESS" | grep -qE '^T[1-9A-HJ-NP-Za-km-z]{33}$'; then
-            echo "Derived PoC address is invalid" >&2
-            exit 1
-          fi
-          printf 'POC_ADDRESS=%s\n' "$POC_ADDRESS" >> "$GITHUB_ENV"
-          echo "PoC account prepared: $POC_ADDRESS"
-
-          python3 - "$POC_ADDRESS" "$RUNNER_TEMP/private-net/conf/private_net_config_witness1.conf" "$RUNNER_TEMP/private-net/conf/private_net_config_others.conf" <<'PY'
-          import pathlib
-          import sys
-
-          address = sys.argv[1]
-          entry = f'''    {{
-              accountName = "RetryPoC"
-              accountType = "Normal"
-              address = "{address}"
-              balance = "1000000000000000"
-            }}
-          '''
-
-          for filename in sys.argv[2:]:
-              path = pathlib.Path(filename)
-              text = path.read_text()
-              if address in text:
-                  continue
-              marker = '\n  ]\n\n  witnesses = ['
-              if marker not in text:
-                  raise SystemExit(f'genesis assets section not found in {path}')
-              path.write_text(text.replace(marker, '\n' + entry + marker, 1))
-          PY
-
-      - name: Start isolated two-node private network
-        working-directory: ${{ runner.temp }}/private-net
-        run: docker compose up -d
-
-      - name: Wait for witness and validator APIs
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-          import time
-          import urllib.request
-
-          ports = (9090, 9190)
-          deadline = time.time() + 600
-          compose = os.environ['RUNNER_TEMP'] + '/private-net/docker-compose.yml'
-
-          def dump_state():
-              subprocess.run(["docker", "compose", "-f", compose, "ps"], check=False)
-              subprocess.run(["docker", "compose", "-f", compose, "logs", "--no-color", "--tail=300"], check=False)
-
-          while time.time() < deadline:
-              all_ready = True
-              for port in ports:
-                  try:
-                      req = urllib.request.Request(
-                          f"http://127.0.0.1:{port}/wallet/getnowblock",
-                          data=b"{}",
-                          headers={"Content-Type": "application/json"},
-                      )
-                      with urllib.request.urlopen(req, timeout=3) as response:
-                          payload = json.load(response)
-                      if not payload.get("block_header"):
-                          all_ready = False
-                  except Exception:
-                      all_ready = False
-
-              if all_ready:
-                  print("Both node APIs are ready.")
-                  raise SystemExit(0)
-
-              try:
-                  states = subprocess.check_output(
-                      ["docker", "compose", "-f", compose, "ps", "-q"],
-                      text=True,
-                  ).splitlines()
-              except subprocess.CalledProcessError:
-                  states = []
-
-              for cid in states:
-                  state = subprocess.check_output(
-                      ["docker", "inspect", "-f", "{{.State.Status}}", cid],
-                      text=True,
-                  ).strip()
-                  if state in ("exited", "dead"):
-                      print(f"Container {cid} stopped during startup: {state}")
-                      dump_state()
-                      raise SystemExit(1)
-
-              time.sleep(2)
-
-          print("Node APIs did not become ready within 10 minutes.")
-          dump_state()
-          raise SystemExit(1)
-          PY
-
-      - name: Verify funded PoC account
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import urllib.request
-
-          address = os.environ['POC_ADDRESS']
-          req = urllib.request.Request(
-              'http://127.0.0.1:9090/wallet/getaccount',
-              data=json.dumps({'address': address, 'visible': True}).encode(),
-              headers={'Content-Type': 'application/json'},
-          )
-          with urllib.request.urlopen(req, timeout=20) as response:
-              account = json.load(response)
-          balance = int(account.get('balance', 0))
-          if not account.get('address') or balance < 1_000_000_000_000:
-              raise SystemExit(f'PoC account was not seeded with sufficient TRX: {account}')
-          print(f"PoC account exists with {balance} SUN")
-          PY
-
-      - name: Submit calibrated transaction sweep
+      - name: Run PoC candidate sweep
         working-directory: poc-v2
         env:
           PRODUCER_RPC: http://127.0.0.1:9090
           VALIDATOR_RPC: http://127.0.0.1:9190
-        run: node run_poc.js | tee poc-submit.log
+          VALIDATOR_LOG: ${{ runner.temp }}/private-net/logs/tron-node1/tron.log
+        run: node run_poc.js
 
       - name: Run fail-closed verifier
         working-directory: poc-v2
+        env:
+          PRODUCER_RPC: http://127.0.0.1:9090
+          VALIDATOR_RPC: http://127.0.0.1:9190
+          VALIDATOR_LOG: ${{ runner.temp }}/private-net/logs/tron-node1/tron.log
         run: |
           test -s poc-result.json
           TXID="$(python3 -c 'import json; print(json.load(open("poc-result.json"))["txid"])')"
+          echo "Selected transaction: $TXID"
+          grep -n "RETRY_POC.*txId=$TXID" \
+            "$RUNNER_TEMP/private-net/logs/tron-node1/tron.log" || true
           python3 verify_retry.py \
             --txid "$TXID" \
-            --producer-rpc http://127.0.0.1:9090 \
-            --validator-rpc http://127.0.0.1:9190 \
-            --validator-log "$RUNNER_TEMP/private-net/logs/tron-node1/tron.log" \
+            --producer-rpc "$PRODUCER_RPC" \
+            --validator-rpc "$VALIDATOR_RPC" \
+            --validator-log "$VALIDATOR_LOG" \
             | tee verifier-output.txt
 
-      - name: Collect node evidence
-        if: always()
-        run: |
-          mkdir -p artifacts
-          if [ -f "$RUNNER_TEMP/private-net/logs/tron-node1/tron.log" ]; then cp "$RUNNER_TEMP/private-net/logs/tron-node1/tron.log" artifacts/validator.log; fi
-          cp poc-v2/verifier-output.txt artifacts/verifier-output.txt 2>/dev/null || true
-          cp poc-v2/poc-submit.log artifacts/poc-submit.log 2>/dev/null || true
-          cp poc-v2/poc-result.json artifacts/poc-result.json 2>/dev/null || true
-          docker compose -f "$RUNNER_TEMP/private-net/docker-compose.yml" logs --no-color > artifacts/docker-compose.log 2>&1 || true
-
-      - name: Upload PoC artifacts
+      - name: Upload PoC evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: retry-poc-evidence
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Destroy temporary environment
-        if: always()
-        run: |
-          docker compose -f "$RUNNER_TEMP/private-net/docker-compose.yml" down -v --remove-orphans || true
-          docker rm -f tron-witness1 tron-node1 2>/dev/null || true
-          docker image rm java-tron-retry-poc:instrumented 2>/dev/null || true
-          sudo rm -rf "$RUNNER_TEMP/private-net" "$RUNNER_TEMP/tron-docker" "$RUNNER_TEMP/java-tron-docker-context"
+          path: |
+            poc-v2/poc-result.json
+            poc-v2/verifier-output.txt
+            ${{ runner.temp }}/private-net/logs/tron-node1/tron.log
+          if-no-files-found: ignore
